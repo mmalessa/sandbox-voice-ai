@@ -2,9 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+var ErrEmptyTranscript = errors.New("empty transcript")
 
 type STT interface {
 	Transcribe(ctx context.Context, audio []byte) (string, error)
@@ -46,7 +49,7 @@ func (s *Service) Process(ctx context.Context, audio []byte) (*Result, error) {
 
 	transcript = strings.TrimSpace(transcript)
 	if transcript == "" {
-		return nil, fmt.Errorf("stt: empty transcript")
+		return nil, ErrEmptyTranscript
 	}
 
 	reply, err := s.llm.Generate(ctx, transcript)

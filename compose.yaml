@@ -5,14 +5,23 @@ services:
       - "8080:8080"
     environment:
       LISTEN_ADDR: ":8080"
-      MOCK_STT: "true"
-      MOCK_TTS: "true"
+      STT_COMMAND: "python3 /app/stt/wrapper.py"
+      WHISPER_MODEL: "tiny"
+      WHISPER_LANGUAGE: "pl"
+      HF_HUB_OFFLINE: "1"
       OLLAMA_URL: "http://ollama:11434"
       OLLAMA_MODEL: "llama3.1:8b"
+    volumes:
+      - whisper-models:/root/.cache/huggingface
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - my-network
 
+volumes:
+  whisper-models:
+
 networks:
   my-network:
+    external: true
+    name: my-network

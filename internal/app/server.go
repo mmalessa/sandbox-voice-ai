@@ -3,8 +3,11 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,10 +23,14 @@ type Server struct {
 	upgrader   websocket.Upgrader
 	orch       *orchestrator.Service
 	cfg        Config
+	sessionMu  sync.Mutex
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	sttClient := buildSTT(cfg)
+	sttClient, err := buildSTT(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build stt: %w", err)
+	}
 	ttsClient := buildTTS(cfg)
 	llmClient := llm.NewOllamaClient(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaPrompt)
 
@@ -68,12 +75,22 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !s.sessionMu.TryLock() {
+		log.Printf("ws rejected: session already active (%s)", r.RemoteAddr)
+		http.Error(w, "session busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.sessionMu.Unlock()
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("websocket upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
+
+	log.Printf("ws connected: %s", r.RemoteAddr)
+	defer log.Printf("ws disconnected: %s", r.RemoteAddr)
 
 	conn.SetReadLimit(s.cfg.ReadLimitBytes)
 
@@ -97,6 +114,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		cancel()
 
 		if procErr != nil {
+			if errors.Is(procErr, orchestrator.ErrEmptyTranscript) {
+				continue
+			}
 			log.Printf("pipeline failed: %v", procErr)
 			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, procErr.Error())
 			_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
@@ -110,11 +130,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func buildSTT(cfg Config) orchestrator.STT {
+func buildSTT(cfg Config) (orchestrator.STT, error) {
 	if cfg.EnableMockSTT || len(cfg.STTCommand) == 0 {
-		return stt.Mock{Transcript: "mock transcript"}
+		return stt.Mock{Transcript: "mock transcript"}, nil
 	}
-	return stt.CLI{Command: cfg.STTCommand}
+	return stt.NewProcess(cfg.STTCommand)
 }
 
 func buildTTS(cfg Config) orchestrator.TTS {

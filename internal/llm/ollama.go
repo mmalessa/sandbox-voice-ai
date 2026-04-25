@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -41,6 +42,7 @@ func NewOllamaClient(baseURL, model, systemPrompt string) *OllamaClient {
 }
 
 func (c *OllamaClient) Generate(ctx context.Context, prompt string) (string, error) {
+	log.Printf("llm prompt: %q", prompt)
 	reqBody := generateRequest{
 		Model:  c.model,
 		System: c.systemPrompt,
@@ -99,5 +101,7 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string) (string, err
 		return "", fmt.Errorf("read stream: %w", err)
 	}
 
-	return out.String(), nil
+	reply := out.String()
+	log.Printf("llm reply: %q", reply)
+	return reply, nil
 }

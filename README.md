@@ -31,17 +31,15 @@ The Go backend keeps only three interfaces:
 
 ### STT
 
-`STT_COMMAND` must point to a program that:
+`STT_COMMAND` must point to a **long-running process** that:
 
-- reads the full audio chunk from `stdin`
-- writes only the final transcript to `stdout`
+- stays alive for the lifetime of the server
+- reads requests in a loop: `[4-byte big-endian uint32: audio length][audio bytes]`
+- writes one response per request: `[transcript text]\n`
 - writes logs/errors to `stderr`
 
-Example wrapper contract:
-
-```bash
-cat audio.webm | ./bin/stt-wrapper
-```
+The model is loaded once at startup; each request pays only inference cost.
+`stt/wrapper.py` (faster-whisper) is the reference implementation.
 
 ### TTS
 
@@ -61,31 +59,40 @@ piper --model /path/to/model.onnx --output-raw
 
 ## Environment
 
-```bash
-export LISTEN_ADDR=:8080
-export OLLAMA_URL=http://127.0.0.1:11434
-export OLLAMA_MODEL=llama3.1:8b
+All configuration lives in `compose.yaml`. Key variables:
 
-# Use mocks for bring-up
-export MOCK_STT=true
-export MOCK_TTS=true
-
-# Or use real local CLIs
-export STT_COMMAND="/absolute/path/to/stt-wrapper"
-export PIPER_COMMAND="piper --model /absolute/path/to/model.onnx --output-raw"
-export PIPER_SAMPLE_RATE=22050
-export PIPER_CHANNELS=1
-export PIPER_BITS_PER_SAMPLE=16
-```
+| Variable | Default in compose | Description |
+|---|---|---|
+| `LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `WHISPER_MODEL` | `tiny` | faster-whisper model size |
+| `WHISPER_LANGUAGE` | `pl` | Force language, skip detection |
+| `STT_COMMAND` | `python3 /app/stt/wrapper.py` | Long-running STT process |
+| `OLLAMA_URL` | `http://ollama:11434` | Ollama API endpoint |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Model name |
+| `PIPER_COMMAND` | `python3 -m piper --model ... --output-raw` | TTS command (raw PCM to stdout) |
+| `PIPER_SAMPLE_RATE` | `22050` | Must match the voice model |
+| `MOCK_STT` | _(unset)_ | Set `true` to bypass real STT |
+| `MOCK_TTS` | _(unset)_ | Set `true` to bypass real TTS |
 
 ## Run
 
 ```bash
-go mod tidy
-go run ./cmd/server
+# 1. Build the Docker image
+make build
+
+# 2. Download models into Docker volumes (once, requires internet)
+make init
+
+# 3. Start and follow logs
+make up
 ```
 
-Open `http://127.0.0.1:8080`, connect, then record.
+Open `http://localhost:8080`, click Connect, then Record.
+
+```bash
+make down   # stop
+make logs   # re-attach to logs without restarting
+```
 
 ## Notes
 

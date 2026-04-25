@@ -1,0 +1,12 @@
+# binaries
+/server
+/cmd/server/server
+
+# go test & profiling artifacts
+*.test
+*.out
+
+.env
+
+.idea/
+.vscode/

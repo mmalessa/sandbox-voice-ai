@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Voice AI MVP</title>
+  <style>
+    :root {
+      --bg: #f3efe7;
+      --card: #fffaf2;
+      --ink: #1f1a17;
+      --accent: #b24c2d;
+      --accent-2: #2f6c63;
+      --border: rgba(31, 26, 23, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Georgia, "Iowan Old Style", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(178, 76, 45, 0.22), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(47, 108, 99, 0.2), transparent 30%),
+        linear-gradient(180deg, #f6f1e8 0%, #efe8dc 100%);
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .panel {
+      width: min(720px, 100%);
+      background: color-mix(in srgb, var(--card) 92%, white);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 24px 60px rgba(45, 33, 23, 0.12);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 4vw, 3rem);
+    }
+    p {
+      margin: 0 0 16px;
+      line-height: 1.5;
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 20px 0;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 20px;
+      font: inherit;
+      color: white;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    button.secondary {
+      background: var(--accent-2);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    pre {
+      margin: 0;
+      padding: 16px;
+      background: rgba(31, 26, 23, 0.06);
+      border-radius: 14px;
+      min-height: 120px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>Local Voice AI MVP</h1>
+    <p>Records one chunk, sends raw WebM audio over WebSocket, waits for the synthesized WAV reply, then plays it.</p>
+    <div class="row">
+      <button id="connect">Connect</button>
+      <button id="record" class="secondary" disabled>Record 3s</button>
+    </div>
+    <pre id="log"></pre>
+    <audio id="player" controls></audio>
+  </main>
+
+  <script>
+    const logEl = document.getElementById("log");
+    const connectBtn = document.getElementById("connect");
+    const recordBtn = document.getElementById("record");
+    const player = document.getElementById("player");
+
+    let socket;
+
+    function log(message) {
+      logEl.textContent += `${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    connectBtn.addEventListener("click", () => {
+      socket = new WebSocket(`ws://${location.host}/ws`);
+      socket.binaryType = "arraybuffer";
+
+      socket.onopen = () => {
+        log("websocket connected");
+        recordBtn.disabled = false;
+      };
+
+      socket.onmessage = (event) => {
+        const blob = new Blob([event.data], { type: "audio/wav" });
+        player.src = URL.createObjectURL(blob);
+        player.play().catch(() => {});
+        log(`received ${blob.size} bytes of TTS audio`);
+      };
+
+      socket.onerror = () => log("websocket error");
+      socket.onclose = (event) => {
+        log(`websocket closed: ${event.code}`);
+        recordBtn.disabled = true;
+      };
+    });
+
+    recordBtn.addEventListener("click", async () => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        log("websocket is not open");
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const chunks = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        const buffer = await blob.arrayBuffer();
+        socket.send(buffer);
+        log(`sent ${buffer.byteLength} bytes of microphone audio`);
+      };
+
+      recorder.start();
+      log("recording for 3 seconds");
+      setTimeout(() => recorder.stop(), 3000);
+    });
+  </script>
+</body>
+</html>

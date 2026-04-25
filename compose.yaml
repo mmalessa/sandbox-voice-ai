@@ -1,4 +1,23 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama/models
+      - ./scripts:/scripts
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
   server:
     build: .
     ports:
@@ -16,16 +35,10 @@ services:
     volumes:
       - whisper-models:/root/.cache/huggingface
       - piper-voices:/app/voices
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - my-network
+    depends_on:
+      - ollama
 
 volumes:
+  ollama-models:
   whisper-models:
   piper-voices:
-
-networks:
-  my-network:
-    external: true
-    name: my-network

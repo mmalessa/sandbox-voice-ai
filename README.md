@@ -67,7 +67,7 @@ All configuration lives in `compose.yaml`. Key variables:
 | `WHISPER_MODEL` | `tiny` | faster-whisper model size |
 | `WHISPER_LANGUAGE` | `pl` | Force language, skip detection |
 | `STT_COMMAND` | `python3 /app/stt/wrapper.py` | Long-running STT process |
-| `OLLAMA_URL` | `http://ollama:11434` | Ollama API endpoint |
+| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint (service within compose) |
 | `OLLAMA_MODEL` | `llama3.1:8b` | Model name |
 | `PIPER_COMMAND` | `python3 -m piper --model ... --output-raw` | TTS command (raw PCM to stdout) |
 | `PIPER_SAMPLE_RATE` | `22050` | Must match the voice model |
@@ -80,7 +80,8 @@ All configuration lives in `compose.yaml`. Key variables:
 # 1. Build the Docker image
 make build
 
-# 2. Download models into Docker volumes (once, requires internet)
+# 2. Download all models into Docker volumes (once, requires internet)
+#    Downloads: Whisper STT, Piper TTS voice, Ollama LLM
 make init
 
 # 3. Start and follow logs
@@ -90,8 +91,9 @@ make up
 Open `http://localhost:8080`, click Connect, then Record.
 
 ```bash
-make down   # stop
-make logs   # re-attach to logs without restarting
+make down          # stop
+make logs          # re-attach to logs without restarting
+make fetch-models  # re-pull Ollama models (ollama must be running)
 ```
 
 ## Notes

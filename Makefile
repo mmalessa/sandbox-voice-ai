@@ -12,10 +12,18 @@ build:
 
 .PHONY: init
 init:
-	docker compose run --rm --no-deps --entrypoint python3 server \
+	docker compose run --rm --no-deps -e HF_HUB_OFFLINE=0 --entrypoint python3 server \
 		-c "import os; from faster_whisper import WhisperModel; \
 		    WhisperModel(os.environ.get('WHISPER_MODEL', 'tiny'), device='cpu', compute_type='int8'); \
-		    print('model ready')"
+		    print('whisper model ready')"
+	docker compose run --rm --no-deps --entrypoint python3 server \
+		-c "import urllib.request, os; \
+		    os.makedirs('/app/voices', exist_ok=True); \
+		    base='https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/'; \
+		    [urllib.request.urlretrieve(base+f, '/app/voices/'+f) or print(f+' ready') \
+		     for f in ['pl_PL-darkman-medium.onnx', 'pl_PL-darkman-medium.onnx.json'] \
+		     if not os.path.exists('/app/voices/'+f)]; \
+		    print('piper voice ready')"
 
 .PHONY: up
 up:

@@ -11,8 +11,11 @@ services:
       HF_HUB_OFFLINE: "1"
       OLLAMA_URL: "http://ollama:11434"
       OLLAMA_MODEL: "llama3.1:8b"
+      PIPER_COMMAND: "python3 -m piper --model /app/voices/pl_PL-darkman-medium.onnx --output-raw"
+      PIPER_SAMPLE_RATE: "22050"
     volumes:
       - whisper-models:/root/.cache/huggingface
+      - piper-voices:/app/voices
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -20,6 +23,7 @@ services:
 
 volumes:
   whisper-models:
+  piper-voices:
 
 networks:
   my-network:

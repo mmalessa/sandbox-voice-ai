@@ -45,6 +45,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWS)
+	mux.HandleFunc("/config", s.handleConfig)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/", s.handleIndex)
 
@@ -59,6 +60,13 @@ func NewServer(cfg Config) (*Server, error) {
 
 func (s *Server) ListenAndServe() error {
 	return s.httpServer.ListenAndServe()
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"vad_silence_ms": s.cfg.VADSilenceMS,
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -110,7 +118,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
-		result, procErr := s.orch.Process(ctx, payload)
+		_, procErr := s.orch.Process(ctx, payload, func(chunk []byte) error {
+			return conn.WriteMessage(websocket.BinaryMessage, chunk)
+		})
 		cancel()
 
 		if procErr != nil {
@@ -123,7 +133,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := conn.WriteMessage(websocket.BinaryMessage, result.Audio); err != nil {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"done"}`)); err != nil {
 			log.Printf("websocket write failed: %v", err)
 			return
 		}

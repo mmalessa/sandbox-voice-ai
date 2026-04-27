@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Local Voice AI MVP</title>
+  <title>Local Voice AI</title>
   <style>
     :root {
       --bg: #f3efe7;
@@ -35,19 +35,14 @@
       padding: 28px;
       box-shadow: 0 24px 60px rgba(45, 33, 23, 0.12);
     }
-    h1 {
-      margin: 0 0 8px;
-      font-size: clamp(2rem, 4vw, 3rem);
-    }
-    p {
-      margin: 0 0 16px;
-      line-height: 1.5;
-    }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3rem); }
+    p { margin: 0 0 16px; line-height: 1.5; }
     .row {
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
       margin: 20px 0;
+      align-items: center;
     }
     button {
       border: 0;
@@ -57,13 +52,19 @@
       color: white;
       background: var(--accent);
       cursor: pointer;
+      transition: background 0.2s;
     }
-    button.secondary {
-      background: var(--accent-2);
+    button.secondary { background: var(--accent-2); }
+    button.recording { background: #8b0000; animation: pulse 1s infinite; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; animation: none; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
     }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
+    #status {
+      font-size: 0.9rem;
+      color: var(--accent-2);
+      font-style: italic;
     }
     pre {
       margin: 0;
@@ -78,54 +79,121 @@
 </head>
 <body>
   <main class="panel">
-    <h1>Local Voice AI MVP</h1>
-    <p>Records one chunk, sends raw WebM audio over WebSocket, waits for the synthesized WAV reply, then plays it.</p>
+    <h1>Local Voice AI</h1>
+    <p>Speak after clicking Record — stops automatically on silence. Response plays as it streams in.</p>
     <div class="row">
       <button id="connect">Connect</button>
-      <button id="record" class="secondary" disabled>Record 3s</button>
+      <button id="record" class="secondary" disabled>Record</button>
+      <span id="status"></span>
     </div>
     <pre id="log"></pre>
-    <audio id="player" controls></audio>
   </main>
 
   <script>
-    const logEl = document.getElementById("log");
+    const logEl     = document.getElementById("log");
     const connectBtn = document.getElementById("connect");
-    const recordBtn = document.getElementById("record");
-    const player = document.getElementById("player");
+    const recordBtn  = document.getElementById("record");
+    const statusEl   = document.getElementById("status");
 
     let socket;
 
-    function log(message) {
-      logEl.textContent += `${message}\n`;
+    function log(msg) {
+      logEl.textContent += `${msg}\n`;
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    connectBtn.addEventListener("click", () => {
-      if (socket && socket.readyState < WebSocket.CLOSING) {
-        socket.close();
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    // --- Audio queue: plays WAV chunks sequentially via AudioContext ---
+    class AudioQueue {
+      constructor() {
+        this._ctx   = null;
+        this._queue = [];
+        this._busy  = false;
       }
+
+      _ctx_() {
+        if (!this._ctx || this._ctx.state === "closed") {
+          this._ctx = new AudioContext();
+        }
+        return this._ctx;
+      }
+
+      enqueue(arrayBuffer) {
+        this._queue.push(arrayBuffer);
+        if (!this._busy) this._next();
+      }
+
+      async _next() {
+        if (this._queue.length === 0) {
+          this._busy = false;
+          return;
+        }
+        this._busy = true;
+        const ctx = this._ctx_();
+        try {
+          const decoded = await ctx.decodeAudioData(this._queue.shift());
+          const src = ctx.createBufferSource();
+          src.buffer = decoded;
+          src.connect(ctx.destination);
+          src.onended = () => this._next();
+          src.start();
+        } catch (e) {
+          log(`audio decode error: ${e.message}`);
+          this._next();
+        }
+      }
+    }
+
+    const audioQueue = new AudioQueue();
+
+    // --- WebSocket ---
+    connectBtn.addEventListener("click", () => {
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+
       socket = new WebSocket(`ws://${location.host}/ws`);
       socket.binaryType = "arraybuffer";
 
       socket.onopen = () => {
         log("websocket connected");
         recordBtn.disabled = false;
+        setStatus("ready");
       };
 
       socket.onmessage = (event) => {
-        const blob = new Blob([event.data], { type: "audio/wav" });
-        player.src = URL.createObjectURL(blob);
-        player.play().catch(() => {});
-        log(`received ${blob.size} bytes of TTS audio`);
+        if (typeof event.data === "string") {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "done") {
+            setStatus("ready");
+            recordBtn.disabled = false;
+            log("response complete");
+          }
+          return;
+        }
+        // Binary = WAV audio chunk — enqueue for sequential playback
+        log(`received ${event.data.byteLength} bytes`);
+        audioQueue.enqueue(event.data);
       };
 
       socket.onerror = () => log("websocket error");
-      socket.onclose = (event) => {
-        log(`websocket closed: ${event.code}`);
+      socket.onclose = (ev) => {
+        log(`websocket closed: ${ev.code}`);
         recordBtn.disabled = true;
+        setStatus("");
       };
     });
+
+    // --- VAD recording ---
+    const SILENCE_THRESHOLD = 0.02;   // RMS amplitude
+    const MAX_RECORD_MS     = 30000;  // safety cap
+    let   SILENCE_MS        = 1500;   // ms of silence before stopping (overridden by /config)
+
+    fetch("/config")
+      .then((r) => r.json())
+      .then((cfg) => { if (cfg.vad_silence_ms) SILENCE_MS = cfg.vad_silence_ms; })
+      .catch(() => {});
 
     recordBtn.addEventListener("click", async () => {
       if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -133,25 +201,92 @@
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      const chunks = [];
+      recordBtn.disabled = true;
+      recordBtn.classList.add("recording");
+      setStatus("Listening...");
 
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunks.push(event.data);
-      };
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        log(`microphone error: ${e.message}`);
+        recordBtn.disabled = false;
+        recordBtn.classList.remove("recording");
+        setStatus("ready");
+        return;
+      }
+
+      const vadCtx    = new AudioContext();
+      const analyser  = vadCtx.createAnalyser();
+      analyser.fftSize = 512;
+      vadCtx.createMediaStreamSource(stream).connect(analyser);
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const chunks   = [];
+
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
 
       recorder.onstop = async () => {
-        stream.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunks, { type: "audio/webm" });
-        const buffer = await blob.arrayBuffer();
-        socket.send(buffer);
-        log(`sent ${buffer.byteLength} bytes of microphone audio`);
+        stream.getTracks().forEach((t) => t.stop());
+        vadCtx.close();
+        recordBtn.classList.remove("recording");
+
+        if (chunks.length === 0) {
+          setStatus("ready");
+          recordBtn.disabled = false;
+          return;
+        }
+
+        const blob = new Blob(chunks, { type: mimeType });
+        const buf  = await blob.arrayBuffer();
+        socket.send(buf);
+        log(`sent ${buf.byteLength} bytes`);
+        setStatus("Processing...");
+        // recordBtn stays disabled until "done" arrives
       };
 
-      recorder.start();
-      log("recording for 3 seconds");
-      setTimeout(() => recorder.stop(), 3000);
+      const pcmData      = new Float32Array(analyser.fftSize);
+      let   speechSeen   = false;
+      let   silenceStart = null;
+      const startTime    = Date.now();
+
+      recorder.start(100);
+
+      function vad() {
+        if (recorder.state !== "recording") return;
+
+        if (Date.now() - startTime > MAX_RECORD_MS) {
+          recorder.stop();
+          return;
+        }
+
+        analyser.getFloatTimeDomainData(pcmData);
+        const rms = Math.sqrt(pcmData.reduce((s, v) => s + v * v, 0) / pcmData.length);
+
+        if (rms > SILENCE_THRESHOLD) {
+          if (!speechSeen) {
+            speechSeen = true;
+            setStatus("Speaking...");
+            log("speech detected");
+          }
+          silenceStart = null;
+        } else if (speechSeen) {
+          if (silenceStart === null) {
+            silenceStart = Date.now();
+          } else if (Date.now() - silenceStart > SILENCE_MS) {
+            log("silence detected — sending");
+            recorder.stop();
+            return;
+          }
+        }
+
+        requestAnimationFrame(vad);
+      }
+
+      requestAnimationFrame(vad);
     });
   </script>
 </body>

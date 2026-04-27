@@ -23,9 +23,10 @@ type Config struct {
 	OllamaPrompt string
 
 	PiperCommand []string
-	PiperSampleRate int
-	PiperChannels   int
+	PiperSampleRate    int
+	PiperChannels      int
 	PiperBitsPerSample int
+	VADSilenceMS       int
 }
 
 func LoadConfig() Config {
@@ -43,6 +44,7 @@ func LoadConfig() Config {
 		PiperSampleRate:    envInt("PIPER_SAMPLE_RATE", 22050),
 		PiperChannels:      envInt("PIPER_CHANNELS", 1),
 		PiperBitsPerSample: envInt("PIPER_BITS_PER_SAMPLE", 16),
+		VADSilenceMS:       envInt("VAD_SILENCE_MS", 2000),
 	}
 }
 

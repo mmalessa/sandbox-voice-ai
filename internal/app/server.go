@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -102,41 +101,100 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(s.cfg.ReadLimitBytes)
 
-	for {
-		msgType, payload, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return
+	// gorilla/websocket requires one concurrent writer.
+	var writeMu sync.Mutex
+	write := func(msgType int, data []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteMessage(msgType, data)
+	}
+
+	sess := s.orch.NewSession()
+
+	for { // outer loop: one iteration per conversation turn
+		sess.Reset()
+
+		sentenceCh := make(chan string, 16)
+		pipeErrCh := make(chan error, 1)
+
+		// LLM+TTS goroutine: serialises synthesis so audio chunks arrive in order.
+		// It starts as soon as a sentence is detected — before vad_end arrives.
+		go func() {
+			var firstErr error
+			for sentence := range sentenceCh {
+				if firstErr != nil {
+					continue // drain after first error
+				}
+				synthCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+				firstErr = s.orch.Synthesize(synthCtx, sentence, func(chunk []byte) error {
+					return write(websocket.BinaryMessage, chunk)
+				})
+				cancel()
+				if firstErr != nil {
+					log.Printf("synthesize: %v", firstErr)
+				}
 			}
-			log.Printf("websocket read failed: %v", err)
+			pipeErrCh <- firstErr
+		}()
+
+		var readErr error
+
+	readLoop:
+		for {
+			msgType, payload, err := conn.ReadMessage()
+			if err != nil {
+				readErr = err
+				break readLoop
+			}
+
+			switch msgType {
+			case websocket.BinaryMessage:
+				// Cumulative audio blob — run STT, detect new complete sentences.
+				sttCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+				addErr := sess.AddAudio(sttCtx, payload, func(sentence string) {
+					sentenceCh <- sentence
+				})
+				cancel()
+				if addErr != nil {
+					log.Printf("stt: %v", addErr)
+				}
+				// Forward partial transcript to browser for display.
+				if partial := sess.Transcript(); partial != "" {
+					if msg, err := json.Marshal(map[string]string{"type": "transcript", "text": partial}); err == nil {
+						_ = write(websocket.TextMessage, msg)
+					}
+				}
+
+			case websocket.TextMessage:
+				var ctrl struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal(payload, &ctrl) == nil && ctrl.Type == "vad_end" {
+					// User stopped speaking — flush remaining transcript fragment.
+					sess.Flush(func(sentence string) { sentenceCh <- sentence })
+					break readLoop
+				}
+			}
+		}
+
+		close(sentenceCh)
+		pipeErr := <-pipeErrCh
+
+		if readErr != nil {
+			if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("websocket read: %v", readErr)
+			}
 			return
 		}
 
-		if msgType != websocket.BinaryMessage {
-			_ = conn.WriteMessage(websocket.TextMessage, []byte("binary audio message required"))
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
-		_, procErr := s.orch.Process(ctx, payload, func(chunk []byte) error {
-			return conn.WriteMessage(websocket.BinaryMessage, chunk)
-		})
-		cancel()
-
-		if procErr != nil {
-			if errors.Is(procErr, orchestrator.ErrEmptyTranscript) {
-				continue
-			}
-			log.Printf("pipeline failed: %v", procErr)
-			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, procErr.Error())
+		if pipeErr != nil {
+			log.Printf("pipeline: %v", pipeErr)
+			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, pipeErr.Error())
 			_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
 			return
 		}
 
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"done"}`)); err != nil {
-			log.Printf("websocket write failed: %v", err)
-			return
-		}
+		_ = write(websocket.TextMessage, []byte(`{"type":"done"}`))
 	}
 }
 
@@ -157,9 +215,9 @@ func buildTTS(cfg Config) orchestrator.TTS {
 	}
 
 	return tts.Piper{
-		Command:        cfg.PiperCommand,
-		SampleRate:     cfg.PiperSampleRate,
-		Channels:       cfg.PiperChannels,
-		BitsPerSample:  cfg.PiperBitsPerSample,
+		Command:       cfg.PiperCommand,
+		SampleRate:    cfg.PiperSampleRate,
+		Channels:      cfg.PiperChannels,
+		BitsPerSample: cfg.PiperBitsPerSample,
 	}
 }

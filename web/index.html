@@ -12,6 +12,7 @@
       --accent: #b24c2d;
       --accent-2: #2f6c63;
       --border: rgba(31, 26, 23, 0.12);
+      --muted: rgba(31, 26, 23, 0.45);
     }
     * { box-sizing: border-box; }
     body {
@@ -36,7 +37,7 @@
       box-shadow: 0 24px 60px rgba(45, 33, 23, 0.12);
     }
     h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3rem); }
-    p { margin: 0 0 16px; line-height: 1.5; }
+    p  { margin: 0 0 16px; line-height: 1.5; }
     .row {
       display: flex;
       gap: 12px;
@@ -54,46 +55,60 @@
       cursor: pointer;
       transition: background 0.2s;
     }
-    button.secondary { background: var(--accent-2); }
-    button.recording { background: #8b0000; animation: pulse 1s infinite; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; animation: none; }
+    button.secondary  { background: var(--accent-2); }
+    button.recording  { background: #8b0000; animation: pulse 1s infinite; }
+    button:disabled   { opacity: 0.5; cursor: not-allowed; animation: none; }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
-      50% { opacity: 0.6; }
+      50%       { opacity: 0.6; }
     }
     #status {
       font-size: 0.9rem;
       color: var(--accent-2);
       font-style: italic;
     }
+    .transcript-box {
+      margin: 0 0 10px;
+      padding: 12px 16px;
+      background: rgba(47, 108, 99, 0.07);
+      border-left: 3px solid var(--accent-2);
+      border-radius: 8px;
+      min-height: 2.4em;
+      font-style: italic;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
     pre {
       margin: 0;
       padding: 16px;
       background: rgba(31, 26, 23, 0.06);
       border-radius: 14px;
-      min-height: 120px;
+      min-height: 80px;
       overflow: auto;
       white-space: pre-wrap;
+      font-size: 0.85rem;
     }
   </style>
 </head>
 <body>
   <main class="panel">
     <h1>Local Voice AI</h1>
-    <p>Speak after clicking Record — stops automatically on silence. Response plays as it streams in.</p>
+    <p>Speak after clicking Record — response begins streaming as sentences are recognised.</p>
     <div class="row">
       <button id="connect">Connect</button>
       <button id="record" class="secondary" disabled>Record</button>
       <span id="status"></span>
     </div>
+    <div class="transcript-box" id="transcript">&nbsp;</div>
     <pre id="log"></pre>
   </main>
 
   <script>
-    const logEl     = document.getElementById("log");
-    const connectBtn = document.getElementById("connect");
-    const recordBtn  = document.getElementById("record");
-    const statusEl   = document.getElementById("status");
+    const logEl        = document.getElementById("log");
+    const connectBtn   = document.getElementById("connect");
+    const recordBtn    = document.getElementById("record");
+    const statusEl     = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
 
     let socket;
 
@@ -102,22 +117,19 @@
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    function setStatus(msg) {
-      statusEl.textContent = msg;
-    }
+    function setStatus(msg)     { statusEl.textContent     = msg; }
+    function setTranscript(msg) { transcriptEl.textContent = msg || " "; }
 
     // --- Audio queue: plays WAV chunks sequentially via AudioContext ---
     class AudioQueue {
       constructor() {
-        this._ctx   = null;
+        this._ctx  = null;
         this._queue = [];
         this._busy  = false;
       }
 
       _ctx_() {
-        if (!this._ctx || this._ctx.state === "closed") {
-          this._ctx = new AudioContext();
-        }
+        if (!this._ctx || this._ctx.state === "closed") this._ctx = new AudioContext();
         return this._ctx;
       }
 
@@ -127,17 +139,13 @@
       }
 
       async _next() {
-        if (this._queue.length === 0) {
-          this._busy = false;
-          return;
-        }
+        if (this._queue.length === 0) { this._busy = false; return; }
         this._busy = true;
-        const ctx = this._ctx_();
         try {
-          const decoded = await ctx.decodeAudioData(this._queue.shift());
-          const src = ctx.createBufferSource();
+          const decoded = await this._ctx_().decodeAudioData(this._queue.shift());
+          const src = this._ctx_().createBufferSource();
           src.buffer = decoded;
-          src.connect(ctx.destination);
+          src.connect(this._ctx_().destination);
           src.onended = () => this._next();
           src.start();
         } catch (e) {
@@ -165,14 +173,16 @@
       socket.onmessage = (event) => {
         if (typeof event.data === "string") {
           const msg = JSON.parse(event.data);
-          if (msg.type === "done") {
+          if (msg.type === "transcript") {
+            setTranscript(msg.text);
+          } else if (msg.type === "done") {
             setStatus("ready");
             recordBtn.disabled = false;
             log("response complete");
           }
           return;
         }
-        // Binary = WAV audio chunk — enqueue for sequential playback
+        // Binary = WAV audio chunk
         log(`received ${event.data.byteLength} bytes`);
         audioQueue.enqueue(event.data);
       };
@@ -182,19 +192,21 @@
         log(`websocket closed: ${ev.code}`);
         recordBtn.disabled = true;
         setStatus("");
+        setTranscript("");
       };
     });
 
-    // --- VAD recording ---
-    const SILENCE_THRESHOLD = 0.02;   // RMS amplitude
-    const MAX_RECORD_MS     = 30000;  // safety cap
-    let   SILENCE_MS        = 1500;   // ms of silence before stopping (overridden by /config)
+    // --- VAD config ---
+    const SILENCE_THRESHOLD = 0.02;
+    const MAX_RECORD_MS     = 30000;
+    let   SILENCE_MS        = 2000;
 
     fetch("/config")
-      .then((r) => r.json())
-      .then((cfg) => { if (cfg.vad_silence_ms) SILENCE_MS = cfg.vad_silence_ms; })
+      .then(r => r.json())
+      .then(cfg => { if (cfg.vad_silence_ms) SILENCE_MS = cfg.vad_silence_ms; })
       .catch(() => {});
 
+    // --- Recording with partial-blob streaming ---
     recordBtn.addEventListener("click", async () => {
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         log("websocket is not open");
@@ -204,6 +216,7 @@
       recordBtn.disabled = true;
       recordBtn.classList.add("recording");
       setStatus("Listening...");
+      setTranscript("");
 
       let stream;
       try {
@@ -216,44 +229,63 @@
         return;
       }
 
-      const vadCtx    = new AudioContext();
-      const analyser  = vadCtx.createAnalyser();
+      const vadCtx   = new AudioContext();
+      const analyser = vadCtx.createAnalyser();
       analyser.fftSize = 512;
       vadCtx.createMediaStreamSource(stream).connect(analyser);
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
-      const recorder = new MediaRecorder(stream, { mimeType });
-      const chunks   = [];
 
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const allChunks = [];
+
+      // Track the most recent send promise to guarantee ordering: the final
+      // cumulative blob always arrives at the server before vad_end.
+      let lastSendPromise = Promise.resolve();
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size === 0) return;
+        allChunks.push(e.data);
+
+        if (!speechSeen || socket.readyState !== WebSocket.OPEN) return;
+
+        // Send the growing cumulative blob so the server can run STT early.
+        const blob = new Blob(allChunks, { type: mimeType });
+        lastSendPromise = blob.arrayBuffer().then(buf => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(buf);
+        });
+      };
 
       recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
+        stream.getTracks().forEach(t => t.stop());
         vadCtx.close();
         recordBtn.classList.remove("recording");
 
-        if (chunks.length === 0) {
+        if (!speechSeen) {
           setStatus("ready");
           recordBtn.disabled = false;
           return;
         }
 
-        const blob = new Blob(chunks, { type: mimeType });
-        const buf  = await blob.arrayBuffer();
-        socket.send(buf);
-        log(`sent ${buf.byteLength} bytes`);
+        // Wait for the last partial send, then signal end-of-turn.
+        await lastSendPromise;
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "vad_end" }));
+        }
         setStatus("Processing...");
-        // recordBtn stays disabled until "done" arrives
+        // recordBtn stays disabled until {"type":"done"} arrives
       };
 
-      const pcmData      = new Float32Array(analyser.fftSize);
-      let   speechSeen   = false;
-      let   silenceStart = null;
-      const startTime    = Date.now();
+      const pcmData    = new Float32Array(analyser.fftSize);
+      let speechSeen   = false;
+      let silenceStart = null;
+      const startTime  = Date.now();
 
-      recorder.start(100);
+      // timeslice=1000: ondataavailable fires every 1s, giving us natural
+      // 1-second audio segments to accumulate and stream to the server.
+      recorder.start(1000);
 
       function vad() {
         if (recorder.state !== "recording") return;
@@ -277,7 +309,7 @@
           if (silenceStart === null) {
             silenceStart = Date.now();
           } else if (Date.now() - silenceStart > SILENCE_MS) {
-            log("silence detected — sending");
+            log("silence detected — sending vad_end");
             recorder.stop();
             return;
           }

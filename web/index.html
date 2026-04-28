@@ -55,9 +55,10 @@
       cursor: pointer;
       transition: background 0.2s;
     }
-    button.secondary  { background: var(--accent-2); }
-    button.recording  { background: #8b0000; animation: pulse 1s infinite; }
-    button:disabled   { opacity: 0.5; cursor: not-allowed; animation: none; }
+    button.secondary   { background: var(--accent-2); }
+    button.recording   { background: #8b0000; animation: pulse 1s infinite; }
+    button.interrupt   { background: #5a3e00; }
+    button:disabled    { opacity: 0.5; cursor: not-allowed; animation: none; }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50%       { opacity: 0.6; }
@@ -93,7 +94,7 @@
 <body>
   <main class="panel">
     <h1>Local Voice AI</h1>
-    <p>Speak after clicking Record — response begins streaming as sentences are recognised.</p>
+    <p>Speak after clicking Record. Click again while AI is responding to interrupt it.</p>
     <div class="row">
       <button id="connect">Connect</button>
       <button id="record" class="secondary" disabled>Record</button>
@@ -111,6 +112,7 @@
     const transcriptEl = document.getElementById("transcript");
 
     let socket;
+    let inTurn = false; // true between vad_end and "done" — enables barge-in
 
     function log(msg) {
       logEl.textContent += `${msg}\n`;
@@ -120,17 +122,31 @@
     function setStatus(msg)     { statusEl.textContent     = msg; }
     function setTranscript(msg) { transcriptEl.textContent = msg || " "; }
 
-    // --- Audio queue: plays WAV chunks sequentially via AudioContext ---
+    // --- Audio queue: plays WAV chunks sequentially, supports clear() for barge-in ---
     class AudioQueue {
       constructor() {
-        this._ctx  = null;
-        this._queue = [];
-        this._busy  = false;
+        this._ctx           = null;
+        this._queue         = [];
+        this._busy          = false;
+        this._currentSource = null;
       }
 
       _ctx_() {
         if (!this._ctx || this._ctx.state === "closed") this._ctx = new AudioContext();
         return this._ctx;
+      }
+
+      busy() { return this._busy; }
+
+      // Stop playback immediately and discard all queued audio.
+      clear() {
+        this._queue = [];
+        this._busy  = false;
+        if (this._currentSource) {
+          this._currentSource.onended = null;
+          try { this._currentSource.stop(); } catch (_) {}
+          this._currentSource = null;
+        }
       }
 
       enqueue(arrayBuffer) {
@@ -139,17 +155,23 @@
       }
 
       async _next() {
-        if (this._queue.length === 0) { this._busy = false; return; }
+        if (this._queue.length === 0) {
+          this._busy          = false;
+          this._currentSource = null;
+          return;
+        }
         this._busy = true;
         try {
           const decoded = await this._ctx_().decodeAudioData(this._queue.shift());
-          const src = this._ctx_().createBufferSource();
-          src.buffer = decoded;
+          const src     = this._ctx_().createBufferSource();
+          src.buffer    = decoded;
           src.connect(this._ctx_().destination);
-          src.onended = () => this._next();
+          src.onended         = () => this._next();
+          this._currentSource = src;
           src.start();
         } catch (e) {
           log(`audio decode error: ${e.message}`);
+          this._currentSource = null;
           this._next();
         }
       }
@@ -173,12 +195,19 @@
       socket.onmessage = (event) => {
         if (typeof event.data === "string") {
           const msg = JSON.parse(event.data);
-          if (msg.type === "transcript") {
-            setTranscript(msg.text);
-          } else if (msg.type === "done") {
-            setStatus("ready");
-            recordBtn.disabled = false;
-            log("response complete");
+          switch (msg.type) {
+            case "transcript":
+              setTranscript(msg.text);
+              break;
+            case "done":
+              inTurn = false;
+              recordBtn.classList.remove("interrupt");
+              recordBtn.classList.add("secondary");
+              recordBtn.textContent = "Record";
+              recordBtn.disabled    = false;
+              setStatus("ready");
+              log("response complete");
+              break;
           }
           return;
         }
@@ -190,6 +219,7 @@
       socket.onerror = () => log("websocket error");
       socket.onclose = (ev) => {
         log(`websocket closed: ${ev.code}`);
+        inTurn = false;
         recordBtn.disabled = true;
         setStatus("");
         setTranscript("");
@@ -206,15 +236,27 @@
       .then(cfg => { if (cfg.vad_silence_ms) SILENCE_MS = cfg.vad_silence_ms; })
       .catch(() => {});
 
-    // --- Recording with partial-blob streaming ---
+    // --- Recording ---
     recordBtn.addEventListener("click", async () => {
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         log("websocket is not open");
         return;
       }
 
+      // Barge-in: user speaks while AI is responding.
+      if (inTurn) {
+        audioQueue.clear();
+        socket.send(JSON.stringify({ type: "interrupt" }));
+        inTurn = false;
+        log("interrupted AI response");
+        setTranscript("");
+        // Fall through — start recording for the new turn.
+      }
+
       recordBtn.disabled = true;
+      recordBtn.classList.remove("interrupt", "secondary");
       recordBtn.classList.add("recording");
+      recordBtn.textContent = "Recording…";
       setStatus("Listening...");
       setTranscript("");
 
@@ -225,6 +267,8 @@
         log(`microphone error: ${e.message}`);
         recordBtn.disabled = false;
         recordBtn.classList.remove("recording");
+        recordBtn.classList.add("secondary");
+        recordBtn.textContent = "Record";
         setStatus("ready");
         return;
       }
@@ -238,20 +282,16 @@
         ? "audio/webm;codecs=opus"
         : "audio/webm";
 
-      const recorder = new MediaRecorder(stream, { mimeType });
-      const allChunks = [];
-
-      // Track the most recent send promise to guarantee ordering: the final
-      // cumulative blob always arrives at the server before vad_end.
+      const recorder     = new MediaRecorder(stream, { mimeType });
+      const allChunks    = [];
       let lastSendPromise = Promise.resolve();
 
+      // 250ms timeslice: partial blobs arrive 4× faster than Stage 3's 1s,
+      // letting STT detect sentence boundaries sooner.
       recorder.ondataavailable = (e) => {
         if (e.data.size === 0) return;
         allChunks.push(e.data);
-
         if (!speechSeen || socket.readyState !== WebSocket.OPEN) return;
-
-        // Send the growing cumulative blob so the server can run STT early.
         const blob = new Blob(allChunks, { type: mimeType });
         lastSendPromise = blob.arrayBuffer().then(buf => {
           if (socket.readyState === WebSocket.OPEN) socket.send(buf);
@@ -264,18 +304,25 @@
         recordBtn.classList.remove("recording");
 
         if (!speechSeen) {
+          recordBtn.classList.add("secondary");
+          recordBtn.textContent = "Record";
+          recordBtn.disabled    = false;
           setStatus("ready");
-          recordBtn.disabled = false;
           return;
         }
 
-        // Wait for the last partial send, then signal end-of-turn.
+        // Ensure the final cumulative blob is sent before vad_end.
         await lastSendPromise;
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: "vad_end" }));
         }
+
+        // Allow barge-in: button re-enabled while AI is processing/responding.
+        inTurn = true;
+        recordBtn.classList.add("interrupt");
+        recordBtn.textContent = "Interrupt";
+        recordBtn.disabled    = false;
         setStatus("Processing...");
-        // recordBtn stays disabled until {"type":"done"} arrives
       };
 
       const pcmData    = new Float32Array(analyser.fftSize);
@@ -283,9 +330,7 @@
       let silenceStart = null;
       const startTime  = Date.now();
 
-      // timeslice=1000: ondataavailable fires every 1s, giving us natural
-      // 1-second audio segments to accumulate and stream to the server.
-      recorder.start(1000);
+      recorder.start(500);
 
       function vad() {
         if (recorder.state !== "recording") return;

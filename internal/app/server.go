@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -117,27 +118,33 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		sentenceCh := make(chan string, 16)
 		pipeErrCh := make(chan error, 1)
 
+		// Per-turn cancellable context: allows interrupt to stop LLM+TTS immediately.
+		pipeCtx, pipeCancel := context.WithCancel(r.Context())
+
 		// LLM+TTS goroutine: serialises synthesis so audio chunks arrive in order.
-		// It starts as soon as a sentence is detected — before vad_end arrives.
+		// Starts processing sentences as soon as they are detected — before vad_end.
 		go func() {
 			var firstErr error
 			for sentence := range sentenceCh {
 				if firstErr != nil {
 					continue // drain after first error
 				}
-				synthCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+				synthCtx, cancel := context.WithTimeout(pipeCtx, s.cfg.RequestTimeout)
 				firstErr = s.orch.Synthesize(synthCtx, sentence, func(chunk []byte) error {
 					return write(websocket.BinaryMessage, chunk)
 				})
 				cancel()
-				if firstErr != nil {
+				if firstErr != nil && !errors.Is(firstErr, context.Canceled) {
 					log.Printf("synthesize: %v", firstErr)
 				}
 			}
 			pipeErrCh <- firstErr
 		}()
 
-		var readErr error
+		var (
+			readErr     error
+			interrupted bool
+		)
 
 	readLoop:
 		for {
@@ -149,7 +156,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 			switch msgType {
 			case websocket.BinaryMessage:
-				// Cumulative audio blob — run STT, detect new complete sentences.
+				// Cumulative audio blob — run STT, surface any newly detected sentences.
 				sttCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 				addErr := sess.AddAudio(sttCtx, payload, func(sentence string) {
 					sentenceCh <- sentence
@@ -158,7 +165,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				if addErr != nil {
 					log.Printf("stt: %v", addErr)
 				}
-				// Forward partial transcript to browser for display.
+				// Forward partial transcript to browser for live display.
 				if partial := sess.Transcript(); partial != "" {
 					if msg, err := json.Marshal(map[string]string{"type": "transcript", "text": partial}); err == nil {
 						_ = write(websocket.TextMessage, msg)
@@ -169,16 +176,32 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				var ctrl struct {
 					Type string `json:"type"`
 				}
-				if json.Unmarshal(payload, &ctrl) == nil && ctrl.Type == "vad_end" {
-					// User stopped speaking — flush remaining transcript fragment.
-					sess.Flush(func(sentence string) { sentenceCh <- sentence })
-					break readLoop
+				if json.Unmarshal(payload, &ctrl) == nil {
+					switch ctrl.Type {
+					case "vad_end":
+						// User stopped speaking — flush remaining transcript fragment.
+						sess.Flush(func(sentence string) { sentenceCh <- sentence })
+						break readLoop
+
+					case "interrupt":
+						// User started speaking while AI was responding.
+						// Cancel the active LLM+TTS pipeline and begin a new turn.
+						interrupted = true
+						pipeCancel()
+						break readLoop
+					}
 				}
 			}
 		}
 
+		// Cancel the pipeline immediately on interrupt or connection loss.
+		// On normal vad_end let the goroutine finish all queued sentences first.
+		if interrupted || readErr != nil {
+			pipeCancel()
+		}
 		close(sentenceCh)
 		pipeErr := <-pipeErrCh
+		pipeCancel() // cleanup — no-op if already called
 
 		if readErr != nil {
 			if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
@@ -187,7 +210,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if pipeErr != nil {
+		if interrupted {
+			// No "done" signal — client is already recording for the new turn.
+			log.Printf("turn interrupted, starting next turn")
+			continue
+		}
+
+		if pipeErr != nil && !errors.Is(pipeErr, context.Canceled) {
 			log.Printf("pipeline: %v", pipeErr)
 			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, pipeErr.Error())
 			_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))

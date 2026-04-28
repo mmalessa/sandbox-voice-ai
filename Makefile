@@ -19,9 +19,9 @@ init:
 	$(DC) run --rm --no-deps --entrypoint python3 server \
 		-c "import urllib.request, os; \
 		    os.makedirs('/app/voices', exist_ok=True); \
-		    base='https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/'; \
+		    base='https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/gosia/medium/'; \
 		    [urllib.request.urlretrieve(base+f, '/app/voices/'+f) or print(f+' ready') \
-		     for f in ['pl_PL-darkman-medium.onnx', 'pl_PL-darkman-medium.onnx.json'] \
+		     for f in ['pl_PL-gosia-medium.onnx', 'pl_PL-gosia-medium.onnx.json'] \
 		     if not os.path.exists('/app/voices/'+f)]; \
 		    print('piper voice ready')"
 	$(DC) exec ollama bash /scripts/fetch-models.sh

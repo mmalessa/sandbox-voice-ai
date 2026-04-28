@@ -103,7 +103,7 @@ type Session struct {
 
 	mu             sync.Mutex
 	prevTranscript string
-	sentenceCount  int // sentences from prevTranscript already delivered
+	delivered      []string // sentences already dispatched to LLM
 }
 
 // Reset clears accumulated state for the start of a new turn.
@@ -111,7 +111,7 @@ func (s *Session) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.prevTranscript = ""
-	s.sentenceCount = 0
+	s.delivered = s.delivered[:0]
 }
 
 // Transcript returns the latest STT result accumulated so far.
@@ -124,6 +124,10 @@ func (s *Session) Transcript() string {
 // AddAudio runs STT on the given cumulative audio blob, diffs the resulting
 // transcript with the previous one, and calls onSentence for each newly
 // detected complete sentence.
+//
+// Only sentences that are confirmed by the appearance of a subsequent sentence
+// are dispatched here — the trailing sentence is always held back because the
+// model may still be refining it (e.g. "Ja." → "Jaka jest stolica Polski?").
 func (s *Session) AddAudio(ctx context.Context, audio []byte, onSentence func(string)) error {
 	transcript, err := s.stt.Transcribe(ctx, audio)
 	if err != nil {
@@ -138,8 +142,11 @@ func (s *Session) AddAudio(ctx context.Context, audio []byte, onSentence func(st
 	s.prevTranscript = transcript
 	sentences, _ := splitSentences(transcript)
 
-	for i := s.sentenceCount; i < len(sentences); i++ {
-		s.sentenceCount++
+	// Dispatch all sentences except the last one. The last sentence may still
+	// be a partial transcription that will be rewritten by the next audio chunk.
+	// Skip sentences already delivered (matched by content).
+	for i := len(s.delivered); i < len(sentences)-1; i++ {
+		s.delivered = append(s.delivered, sentences[i])
 		onSentence(sentences[i])
 	}
 	return nil
@@ -153,10 +160,9 @@ func (s *Session) Flush(onSentence func(string)) {
 
 	sentences, remainder := splitSentences(s.prevTranscript)
 
-	for i := s.sentenceCount; i < len(sentences); i++ {
+	for i := len(s.delivered); i < len(sentences); i++ {
 		onSentence(sentences[i])
 	}
-	s.sentenceCount = len(sentences)
 
 	if remainder = strings.TrimSpace(remainder); remainder != "" {
 		onSentence(remainder)

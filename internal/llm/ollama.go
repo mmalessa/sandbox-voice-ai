@@ -12,6 +12,11 @@ import (
 	"strings"
 )
 
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type OllamaClient struct {
 	baseURL      string
 	model        string
@@ -19,17 +24,16 @@ type OllamaClient struct {
 	httpClient   *http.Client
 }
 
-type generateRequest struct {
-	Model  string `json:"model"`
-	System string `json:"system,omitempty"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+type chatRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
 }
 
-type generateChunk struct {
-	Response string `json:"response"`
-	Done     bool   `json:"done"`
-	Error    string `json:"error"`
+type chatChunk struct {
+	Message Message `json:"message"`
+	Done    bool    `json:"done"`
+	Error   string  `json:"error"`
 }
 
 func NewOllamaClient(baseURL, model, systemPrompt string) *OllamaClient {
@@ -41,23 +45,22 @@ func NewOllamaClient(baseURL, model, systemPrompt string) *OllamaClient {
 	}
 }
 
-// GenerateStream streams response tokens from Ollama, calling onToken for each non-empty token.
-// Returns when the stream is complete or onToken returns an error.
-func (c *OllamaClient) GenerateStream(ctx context.Context, prompt string, onToken func(string) error) error {
-	log.Printf("llm prompt: %q", prompt)
-	reqBody := generateRequest{
-		Model:  c.model,
-		System: c.systemPrompt,
-		Prompt: prompt,
-		Stream: true,
-	}
+// GenerateStream streams response tokens from Ollama /api/chat, calling onToken for each token.
+func (c *OllamaClient) GenerateStream(ctx context.Context, messages []Message, onToken func(string) error) error {
+	log.Printf("llm prompt: %q", lastUserContent(messages))
 
-	body, err := json.Marshal(reqBody)
+	all := make([]Message, 0, len(messages)+1)
+	if c.systemPrompt != "" {
+		all = append(all, Message{Role: "system", Content: c.systemPrompt})
+	}
+	all = append(all, messages...)
+
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: all, Stream: true})
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/generate", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -82,26 +85,30 @@ func (c *OllamaClient) GenerateStream(ctx context.Context, prompt string, onToke
 		if line == "" {
 			continue
 		}
-
-		var chunk generateChunk
+		var chunk chatChunk
 		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
 			return fmt.Errorf("decode stream chunk: %w", err)
 		}
-
 		if chunk.Error != "" {
 			return fmt.Errorf("ollama error: %s", chunk.Error)
 		}
-
-		if chunk.Response != "" {
-			if err := onToken(chunk.Response); err != nil {
+		if chunk.Message.Content != "" {
+			if err := onToken(chunk.Message.Content); err != nil {
 				return err
 			}
 		}
-
 		if chunk.Done {
 			break
 		}
 	}
-
 	return scanner.Err()
+}
+
+func lastUserContent(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].Content
+		}
+	}
+	return ""
 }

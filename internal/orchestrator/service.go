@@ -2,30 +2,26 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+
+	"sandbox-voice-ai/internal/llm"
 )
 
-var ErrEmptyTranscript = errors.New("empty transcript")
+var ErrEmptyTranscript = fmt.Errorf("empty transcript")
 
 type STT interface {
 	Transcribe(ctx context.Context, audio []byte) (string, error)
 }
 
 type LLM interface {
-	GenerateStream(ctx context.Context, prompt string, onToken func(string) error) error
+	GenerateStream(ctx context.Context, messages []llm.Message, onToken func(string) error) error
 }
 
 type TTS interface {
 	Synthesize(ctx context.Context, text string) ([]byte, error)
-}
-
-type Result struct {
-	Transcript string
-	Response   string
 }
 
 type Service struct {
@@ -43,11 +39,11 @@ func (s *Service) NewSession() *Session {
 	return &Session{stt: s.stt}
 }
 
-// Synthesize streams an LLM response for the given user text, splits the response
+// Synthesize streams an LLM response for the given messages, splits the response
 // into sentences, synthesizes each with TTS and delivers WAV chunks via onAudio.
-func (s *Service) Synthesize(ctx context.Context, text string, onAudio func([]byte) error) error {
-	log.Printf("llm prompt: %q", text)
-	var buf strings.Builder
+// Returns the full assistant response text.
+func (s *Service) Synthesize(ctx context.Context, messages []llm.Message, onAudio func([]byte) error) (string, error) {
+	var buf, fullResponse strings.Builder
 
 	synth := func(sentence string) error {
 		sentence = strings.TrimSpace(sentence)
@@ -62,8 +58,9 @@ func (s *Service) Synthesize(ctx context.Context, text string, onAudio func([]by
 		return onAudio(wav)
 	}
 
-	err := s.llm.GenerateStream(ctx, text, func(token string) error {
+	err := s.llm.GenerateStream(ctx, messages, func(token string) error {
 		buf.WriteString(token)
+		fullResponse.WriteString(token)
 		sentences, remainder := splitSentences(buf.String())
 		buf.Reset()
 		buf.WriteString(remainder)
@@ -75,38 +72,57 @@ func (s *Service) Synthesize(ctx context.Context, text string, onAudio func([]by
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("llm: %w", err)
+		return "", fmt.Errorf("llm: %w", err)
 	}
-	return synth(buf.String())
+	if err := synth(buf.String()); err != nil {
+		return "", err
+	}
+	return fullResponse.String(), nil
 }
 
-// Process is the one-shot pipeline: STT → Synthesize (LLM streaming + TTS per sentence).
-func (s *Service) Process(ctx context.Context, audio []byte, onAudio func([]byte) error) (*Result, error) {
-	transcript, err := s.stt.Transcribe(ctx, audio)
-	if err != nil {
-		return nil, fmt.Errorf("stt: %w", err)
-	}
-	transcript = strings.TrimSpace(transcript)
-	if transcript == "" {
-		return nil, ErrEmptyTranscript
-	}
-	if err := s.Synthesize(ctx, transcript, onAudio); err != nil {
-		return nil, err
-	}
-	return &Result{Transcript: transcript}, nil
-}
+const maxHistoryTurns = 10
 
 // Session accumulates STT results across growing audio chunks and surfaces
 // complete sentences as soon as they are detected — before the user stops speaking.
+// It also maintains conversation history across turns.
 type Session struct {
 	stt STT
 
+	// per-turn STT state (reset each turn)
 	mu             sync.Mutex
 	prevTranscript string
-	delivered      []string // sentences already dispatched to LLM
+	delivered      []string
+
+	// conversation history (persists across turns)
+	history []llm.Message
 }
 
-// Reset clears accumulated state for the start of a new turn.
+// Messages builds the full message slice for the current LLM call: history + new user message.
+func (s *Session) Messages(userText string) []llm.Message {
+	msgs := make([]llm.Message, len(s.history)+1)
+	copy(msgs, s.history)
+	msgs[len(s.history)] = llm.Message{Role: "user", Content: userText}
+	return msgs
+}
+
+// AppendTurn records a completed turn in conversation history.
+func (s *Session) AppendTurn(userText, assistantText string) {
+	userText      = strings.TrimSpace(userText)
+	assistantText = strings.TrimSpace(assistantText)
+	if userText == "" || assistantText == "" {
+		return
+	}
+	s.history = append(s.history,
+		llm.Message{Role: "user", Content: userText},
+		llm.Message{Role: "assistant", Content: assistantText},
+	)
+	if len(s.history) > maxHistoryTurns*2 {
+		s.history = s.history[len(s.history)-maxHistoryTurns*2:]
+	}
+	log.Printf("history: %d turn(s)", len(s.history)/2)
+}
+
+// Reset clears per-turn STT state. Conversation history is preserved.
 func (s *Session) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,9 +158,6 @@ func (s *Session) AddAudio(ctx context.Context, audio []byte, onSentence func(st
 	s.prevTranscript = transcript
 	sentences, _ := splitSentences(transcript)
 
-	// Dispatch all sentences except the last one. The last sentence may still
-	// be a partial transcription that will be rewritten by the next audio chunk.
-	// Skip sentences already delivered (matched by content).
 	for i := len(s.delivered); i < len(sentences)-1; i++ {
 		s.delivered = append(s.delivered, sentences[i])
 		onSentence(sentences[i])

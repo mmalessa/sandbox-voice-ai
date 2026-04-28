@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,8 +116,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	for { // outer loop: one iteration per conversation turn
 		sess.Reset()
 
-		sentenceCh := make(chan string, 16)
-		pipeErrCh := make(chan error, 1)
+		type pipeResult struct {
+			err      error
+			response string
+		}
+		sentenceCh   := make(chan string, 16)
+		pipeResultCh := make(chan pipeResult, 1)
 
 		// Per-turn cancellable context: allows interrupt to stop LLM+TTS immediately.
 		pipeCtx, pipeCancel := context.WithCancel(r.Context())
@@ -125,20 +130,24 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// Starts processing sentences as soon as they are detected — before vad_end.
 		go func() {
 			var firstErr error
+			var fullResponse strings.Builder
 			for sentence := range sentenceCh {
 				if firstErr != nil {
 					continue // drain after first error
 				}
 				synthCtx, cancel := context.WithTimeout(pipeCtx, s.cfg.RequestTimeout)
-				firstErr = s.orch.Synthesize(synthCtx, sentence, func(chunk []byte) error {
+				resp, err := s.orch.Synthesize(synthCtx, sess.Messages(sentence), func(chunk []byte) error {
 					return write(websocket.BinaryMessage, chunk)
 				})
 				cancel()
-				if firstErr != nil && !errors.Is(firstErr, context.Canceled) {
-					log.Printf("synthesize: %v", firstErr)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					firstErr = err
+					log.Printf("synthesize: %v", err)
+				} else if err == nil {
+					fullResponse.WriteString(resp)
 				}
 			}
-			pipeErrCh <- firstErr
+			pipeResultCh <- pipeResult{err: firstErr, response: fullResponse.String()}
 		}()
 
 		var (
@@ -200,7 +209,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			pipeCancel()
 		}
 		close(sentenceCh)
-		pipeErr := <-pipeErrCh
+		result := <-pipeResultCh
 		pipeCancel() // cleanup — no-op if already called
 
 		if readErr != nil {
@@ -216,9 +225,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if pipeErr != nil && !errors.Is(pipeErr, context.Canceled) {
-			log.Printf("pipeline: %v", pipeErr)
-			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, pipeErr.Error())
+		// Record the completed turn in conversation history.
+		if result.err == nil {
+			sess.AppendTurn(sess.Transcript(), result.response)
+		}
+
+		if result.err != nil && !errors.Is(result.err, context.Canceled) {
+			log.Printf("pipeline: %v", result.err)
+			closeMsg := websocket.FormatCloseMessage(websocket.CloseInternalServerErr, result.err.Error())
 			_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
 			return
 		}

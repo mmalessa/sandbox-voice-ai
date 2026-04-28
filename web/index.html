@@ -227,9 +227,10 @@
     });
 
     // --- VAD config ---
-    const SILENCE_THRESHOLD = 0.02;
-    const MAX_RECORD_MS     = 30000;
-    let   SILENCE_MS        = 2000;
+    const SILENCE_THRESHOLD  = 0.02;
+    const MAX_RECORD_MS      = 30000;
+    const SHORT_SILENCE_MS   = 250;  // pause long enough to trigger STT
+    let   SILENCE_MS         = 2000;
 
     fetch("/config")
       .then(r => r.json())
@@ -282,21 +283,23 @@
         ? "audio/webm;codecs=opus"
         : "audio/webm";
 
-      const recorder     = new MediaRecorder(stream, { mimeType });
-      const allChunks    = [];
+      const recorder      = new MediaRecorder(stream, { mimeType });
+      const allChunks     = [];
       let lastSendPromise = Promise.resolve();
 
-      // 250ms timeslice: partial blobs arrive 4× faster than Stage 3's 1s,
-      // letting STT detect sentence boundaries sooner.
+      // Accumulate only — STT sends are driven by silence detection in the VAD loop.
       recorder.ondataavailable = (e) => {
         if (e.data.size === 0) return;
         allChunks.push(e.data);
+      };
+
+      function sendToSTT() {
         if (!speechSeen || socket.readyState !== WebSocket.OPEN) return;
         const blob = new Blob(allChunks, { type: mimeType });
         lastSendPromise = blob.arrayBuffer().then(buf => {
           if (socket.readyState === WebSocket.OPEN) socket.send(buf);
         });
-      };
+      }
 
       recorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
@@ -325,12 +328,13 @@
         setStatus("Processing...");
       };
 
-      const pcmData    = new Float32Array(analyser.fftSize);
-      let speechSeen   = false;
-      let silenceStart = null;
-      const startTime  = Date.now();
+      const pcmData       = new Float32Array(analyser.fftSize);
+      let speechSeen      = false;
+      let silenceStart    = null;
+      let shortSilenceSent = false; // true once STT was triggered for the current pause
+      const startTime     = Date.now();
 
-      recorder.start(500);
+      recorder.start(100);
 
       function vad() {
         if (recorder.state !== "recording") return;
@@ -349,14 +353,26 @@
             setStatus("Speaking...");
             log("speech detected");
           }
-          silenceStart = null;
+          silenceStart     = null;
+          shortSilenceSent = false; // reset so next pause triggers STT again
         } else if (speechSeen) {
           if (silenceStart === null) {
             silenceStart = Date.now();
-          } else if (Date.now() - silenceStart > SILENCE_MS) {
-            log("silence detected — sending vad_end");
-            recorder.stop();
-            return;
+          } else {
+            const silenceDuration = Date.now() - silenceStart;
+
+            // Short pause → send cumulative audio to STT for a partial transcript.
+            if (silenceDuration >= SHORT_SILENCE_MS && !shortSilenceSent) {
+              shortSilenceSent = true;
+              sendToSTT();
+            }
+
+            // Long pause → end of turn.
+            if (silenceDuration >= SILENCE_MS) {
+              log("silence detected — sending vad_end");
+              recorder.stop();
+              return;
+            }
           }
         }
 

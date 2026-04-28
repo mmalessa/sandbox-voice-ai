@@ -25,7 +25,7 @@ services:
     environment:
       LISTEN_ADDR: ":8080"
       STT_COMMAND: "python3 /app/stt/wrapper.py"
-      WHISPER_MODEL: "base"
+      WHISPER_MODEL: "medium" # tiny, base, small, medium, large-v2, large-v3, large-v3-turbo
       WHISPER_LANGUAGE: "pl"
       HF_HUB_OFFLINE: "1"
       OLLAMA_URL: "http://ollama:11434"
